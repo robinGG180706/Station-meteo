@@ -1,10 +1,7 @@
 // ============================================================================
 // STATION MÉTÉO - VERSION ROBUSTE
-// Conforme aux standards MISRA-C (adaptés pour Arduino)
-// Protection contre: débordements, corruption EEPROM, blocages I2C, brownout
 // ============================================================================
 
-// Bibliothèques
 #include <Wire.h>
 #include <Adafruit_AHTX0.h>
 #include <Adafruit_BMP085.h>
@@ -12,11 +9,7 @@
 #include <TM1640.h>
 #include <FastLED.h>
 #include <EEPROM.h>
-#include <avr/wdt.h> // Watchdog Timer
-
-// ============================================================================
-// CONSTANTES (MISRA: Pas de magic numbers)
-// ============================================================================
+#include <avr/wdt.h>
 
 // --- Hardware pins ---
 #define TM1640_DIN_PIN 2
@@ -36,9 +29,9 @@
 #define WATCHDOG_TIMEOUT_MS WDTO_8S // 8 secondes
 
 // --- EEPROM constants ---
-#define EEPROM_MAGIC_V2 0xAB43 // Changé pour forcer réinit avec nouvelle structure
+#define EEPROM_MAGIC_V2 0xAB48 // Changé pour forcer réinit avec nouvelle structure. FAUT CHANGER L'ADRESSE POUR FLASHER UNE NOUVELLE VERSION !
 #define EEPROM_NUM_SLOTS 4     // Wear leveling: 4 slots rotatifs
-#define EEPROM_SLOT_SIZE 32    // Taille d'un slot (struct + CRC)
+#define EEPROM_SLOT_SIZE 32    
 
 // --- Validation des capteurs ---
 #define TEMP_MIN_VALID -40.0F
@@ -47,22 +40,27 @@
 #define HUM_MAX_VALID 100.0F
 #define PRES_MIN_VALID 870.0F
 #define PRES_MAX_VALID 1085.0F
-#define CO2_MIN_VALID 400
+#define CO2_MIN_VALID 300
 #define CO2_MAX_VALID 5000
+
+// --- Plausibility: max allowed delta between consecutive readings ---
+#define TEMP_MAX_DELTA 3.0F
+#define HUM_MAX_DELTA 10.0F
+#define PRES_MAX_DELTA 5.0F
+#define CO2_MAX_DELTA 500U
 
 // --- Float comparison epsilon ---
 #define FLOAT_EPSILON 0.001F
 
 // --- Display constants ---
 #define DISPLAY_BRIGHTNESS 4
-#define TEMP_OFFSET 30 // Offset pour affichage température (soustraire 3.0°C)
-#define TEMP_OFFSET_DECIMAL 30
+#define TEMP_OFFSET_DECIMAL 55 // Valeur en dixièmes
 
 // --- I2C Recovery ---
 #define I2C_MAX_RECOVERY_ATTEMPTS 3
 
 // --- LED Configuration ---
-#define LED_BRIGHTNESS 10 // 10/255 ≈ 4% pour limiter le courant
+#define LED_BRIGHTNESS 8 // 8/255 ≈ 3%
 
 // --- CO2 Gradient LEDs ---
 const CRGB CO2_COULEURS[NUM_LEDS] = {
@@ -73,10 +71,25 @@ const CRGB CO2_COULEURS[NUM_LEDS] = {
     CRGB(255, 0, 0)    // LED 4: rouge
 };
 
-const uint16_t CO2_SEUILS[NUM_LEDS] = {400, 600, 800, 1000, 1500};
+const uint16_t CO2_SEUILS[NUM_LEDS] = {200, 800, 1000, 1300, 1600};
 
-// --- Pressure indicator zones ---
-const float PRES_PALIERS[4] = {960.0F, 980.0F, 1000.0F, 1020.0F};
+// --- Altitude et météo (pression au niveau de la mer) ---
+#define ALTITUDE_M 450.0F   
+#define PRES_HISTORY_SIZE 12U 
+#define PRES_HISTORY_INTERVAL_MS 900000UL
+#define WEATHER_TREND_RISE 2.0F    // hPa/3h → tendance hausse
+#define WEATHER_TREND_FALL (-2.0F) // hPa/3h → tendance baisse
+
+// basés sur la pression niveau mer
+const float WEATHER_THRESHOLDS[4] = {995.0F, 1005.0F, 1015.0F, 1025.0F};
+
+const CRGB WEATHER_LED_COLORS[5] = {
+    CRGB(255, 0, 0),
+    CRGB(0, 0, 255),
+    CRGB(200, 200, 200),
+    CRGB(0, 200, 0),
+    CRGB(255, 200, 0),
+};
 
 // ============================================================================
 // STRUCTURES DE DONNÉES
@@ -103,17 +116,33 @@ enum DisplayState : uint8_t
     STATE_SHOW_MAX = 2
 };
 
+enum WeatherForecast : uint8_t
+{
+    WEATHER_STORMY = 0,
+    WEATHER_RAINY = 1,
+    WEATHER_CLOUDY = 2,
+    WEATHER_FAIR = 3,
+    WEATHER_SUNNY = 4
+};
+
+struct PressureEntry
+{
+    float pressure;     // hPa niveau mer
+    unsigned long time; // millis()
+};
+
 // Structure pour données des capteurs
 struct SensorData
 {
     float temperature;
     float humidity;
-    float pressure;
+    float pressure;    // pression locale absolue (hPa)
+    float pressureSea; // pression ramenée au niveau de la mer (hPa)
     uint16_t eco2;
     bool valid;
 };
 
-// Compteurs de diagnostic (optionnel, pour debugging)
+// Compteurs de diagnostic pour debugging
 struct DiagCounters
 {
     uint16_t i2cTimeouts;
@@ -127,7 +156,6 @@ struct DiagCounters
 // VARIABLES GLOBALES (toutes statiques)
 // ============================================================================
 
-// Objets hardware
 static Adafruit_AHTX0 aht;
 static Adafruit_BMP085 bmp;
 static DFRobot_ENS160_I2C ens160(&Wire, 0x53);
@@ -135,7 +163,6 @@ static TM1640 display(TM1640_DIN_PIN, TM1640_CLK_PIN, false, DISPLAY_BRIGHTNESS)
 static CRGB ledsA[NUM_LEDS];
 static CRGB ledsB[NUM_LEDS];
 
-// État système
 static MinMaxData mmData;
 static SensorData currentSensor;
 static DiagCounters diagCounters = {0, 0, 0, 0, 0};
@@ -146,9 +173,14 @@ static uint8_t currentEepromSlot = 0;
 static float lastTempComp = -999.0F;
 static float lastHumComp = -999.0F;
 
-// ============================================================================
-// PROTOTYPES DE FONCTIONS (MISRA compliance)
-// ============================================================================
+static SensorData lastValidSensor = {0.0F, 0.0F, 0.0F, 0.0F, 0U, false};
+
+// Historique pression pour tendance 3h
+static PressureEntry pressureHistory[PRES_HISTORY_SIZE];
+static uint8_t pressureHistoryHead = 0U;
+static uint8_t pressureHistoryCount = 0U;
+static unsigned long lastPressureHistoryTime = 0UL;
+static WeatherForecast currentWeather = WEATHER_CLOUDY;
 
 // Core functions
 void systemInit(void);
@@ -169,8 +201,14 @@ void compensateENS160(float temp, float hum);
 
 // Display management
 void displayValues(float temp, float hum, uint16_t co2, float pres);
-void updateLedsNormal(uint16_t co2, float pres);
+void updateLedsNormal(uint16_t co2, WeatherForecast weather);
 void updateLedsOff(void);
+
+// Weather
+float computeSeaLevelPressure(float pressure_hPa, float altitude_m);
+void updatePressureHistory(float pressureSea, unsigned long now);
+float getPressureTrend(void);
+WeatherForecast classifyWeather(float pressureSea, float trend_3h);
 
 // MinMax tracking
 void updateMinMax(const SensorData *data);
@@ -178,13 +216,12 @@ void updateMinMax(const SensorData *data);
 // I2C management
 bool recoverI2C(void);
 
+// Sensor plausibility
+bool validateSensorPlausibility(const SensorData *data);
+
 // Utilities
 bool floatEqual(float a, float b, float epsilon);
 int32_t constrainInt(int32_t value, int32_t min_val, int32_t max_val);
-
-// ============================================================================
-// CRC16-CCITT Implementation
-// ============================================================================
 
 uint16_t calculateCRC16(const uint8_t *data, uint16_t length)
 {
@@ -347,6 +384,77 @@ void saveMinMaxToEEPROM(void)
 }
 
 // ============================================================================
+// WEATHER COMPUTATION
+// ============================================================================
+
+float computeSeaLevelPressure(float pressure_hPa, float altitude_m)
+{
+    return pressure_hPa / powf(1.0F - altitude_m / 44330.0F, 5.255F);
+}
+
+void updatePressureHistory(float pressureSea, unsigned long now)
+{
+    pressureHistory[pressureHistoryHead].pressure = pressureSea;
+    pressureHistory[pressureHistoryHead].time = now;
+    pressureHistoryHead = (uint8_t)((pressureHistoryHead + 1U) % PRES_HISTORY_SIZE);
+    if (pressureHistoryCount < PRES_HISTORY_SIZE)
+    {
+        pressureHistoryCount++;
+    }
+}
+
+float getPressureTrend(void)
+{
+    if (pressureHistoryCount < 2U)
+    {
+        return 0.0F;
+    }
+
+    uint8_t oldestIdx = (uint8_t)((pressureHistoryHead + PRES_HISTORY_SIZE - pressureHistoryCount) % PRES_HISTORY_SIZE);
+    uint8_t newestIdx = (uint8_t)((pressureHistoryHead + PRES_HISTORY_SIZE - 1U) % PRES_HISTORY_SIZE);
+
+    float deltaPres = pressureHistory[newestIdx].pressure - pressureHistory[oldestIdx].pressure;
+    unsigned long deltaMs = pressureHistory[newestIdx].time - pressureHistory[oldestIdx].time;
+
+    if (deltaMs == 0UL)
+    {
+        return 0.0F;
+    }
+
+    float deltaH = (float)deltaMs / 3600000.0F;
+    return deltaPres * 3.0F / deltaH; // normalisé en hPa/3h
+}
+
+WeatherForecast classifyWeather(float pressureSea, float trend_3h)
+{
+    if (pressureSea < WEATHER_THRESHOLDS[0])
+    {
+        return WEATHER_STORMY;
+    }
+    if (pressureSea < WEATHER_THRESHOLDS[1])
+    {
+        return (trend_3h < WEATHER_TREND_FALL) ? WEATHER_STORMY : WEATHER_RAINY;
+    }
+    if (pressureSea < WEATHER_THRESHOLDS[2])
+    {
+        if (trend_3h > WEATHER_TREND_RISE)
+        {
+            return WEATHER_FAIR;
+        }
+        if (trend_3h < WEATHER_TREND_FALL)
+        {
+            return WEATHER_RAINY;
+        }
+        return WEATHER_CLOUDY;
+    }
+    if (pressureSea < WEATHER_THRESHOLDS[3])
+    {
+        return (trend_3h < WEATHER_TREND_FALL) ? WEATHER_CLOUDY : WEATHER_FAIR;
+    }
+    return WEATHER_SUNNY;
+}
+
+// ============================================================================
 // SENSOR MANAGEMENT
 // ============================================================================
 
@@ -413,6 +521,58 @@ void compensateENS160(float temp, float hum)
     }
 }
 
+bool validateSensorPlausibility(const SensorData *data)
+{
+    if (!lastValidSensor.valid)
+    {
+        return true; // première lecture, pas de référence
+    }
+
+    float tempDiff = data->temperature - lastValidSensor.temperature;
+    if (tempDiff < 0.0F)
+    {
+        tempDiff = -tempDiff;
+    }
+    if (tempDiff > TEMP_MAX_DELTA)
+    {
+        Serial.println(F("[SENSOR] Temperature jump"));
+        return false;
+    }
+
+    float humDiff = data->humidity - lastValidSensor.humidity;
+    if (humDiff < 0.0F)
+    {
+        humDiff = -humDiff;
+    }
+    if (humDiff > HUM_MAX_DELTA)
+    {
+        Serial.println(F("[SENSOR] Humidity jump"));
+        return false;
+    }
+
+    float presDiff = data->pressure - lastValidSensor.pressure;
+    if (presDiff < 0.0F)
+    {
+        presDiff = -presDiff;
+    }
+    if (presDiff > PRES_MAX_DELTA)
+    {
+        Serial.println(F("[SENSOR] Pressure jump"));
+        return false;
+    }
+
+    uint16_t co2Diff = (data->eco2 > lastValidSensor.eco2)
+                           ? (data->eco2 - lastValidSensor.eco2)
+                           : (lastValidSensor.eco2 - data->eco2);
+    if (co2Diff > CO2_MAX_DELTA)
+    {
+        Serial.println(F("[SENSOR] CO2 jump"));
+        return false;
+    }
+
+    return true;
+}
+
 bool readSensors(SensorData *data)
 {
     if (data == NULL)
@@ -420,8 +580,10 @@ bool readSensors(SensorData *data)
         return false;
     }
 
-    // Reset watchdog avant opérations I2C longues
+// Reset watchdog avant opérations I2C longues
+#if ENABLE_WATCHDOG
     wdt_reset();
+#endif
 
     // Lecture AHT2x (température et humidité)
     sensors_event_t hev, tev;
@@ -434,7 +596,7 @@ bool readSensors(SensorData *data)
         return false;
     }
 
-    data->temperature = tev.temperature;
+    data->temperature = tev.temperature - ((float)TEMP_OFFSET_DECIMAL / 10.0F);
     data->humidity = hev.relative_humidity;
 
     // Lecture BMP180 (pression)
@@ -446,6 +608,7 @@ bool readSensors(SensorData *data)
         return false;
     }
     data->pressure = (float)rawPressure / 100.0F;
+    data->pressureSea = computeSeaLevelPressure(data->pressure, ALTITUDE_M);
 
     // Compensation et lecture ENS160 (CO2)
     compensateENS160(data->temperature, data->humidity);
@@ -467,7 +630,7 @@ bool readSensors(SensorData *data)
 
     data->valid = true;
 
-    // Validation finale
+    // Validation finale (plages absolues)
     if (!validateSensorData(data))
     {
         diagCounters.invalidReadings++;
@@ -475,6 +638,15 @@ bool readSensors(SensorData *data)
         return false;
     }
 
+    // Validation par plausibilité (delta avec mesure précédente)
+    if (!validateSensorPlausibility(data))
+    {
+        diagCounters.invalidReadings++;
+        data->valid = false;
+        return false;
+    }
+
+    lastValidSensor = *data;
     return true;
 }
 
@@ -488,7 +660,9 @@ bool recoverI2C(void)
 
     for (uint8_t attempt = 0; attempt < I2C_MAX_RECOVERY_ATTEMPTS; attempt++)
     {
+#if ENABLE_WATCHDOG
         wdt_reset();
+#endif
 
         Wire.end();
         delay(100);
@@ -530,9 +704,9 @@ int32_t constrainInt(int32_t value, int32_t min_val, int32_t max_val)
 
 void displayValues(float temp, float hum, uint16_t co2, float pres)
 {
-    // Température (format: XX.X avec offset de -3.0°C)
+    // Température (format: XX.X — correction déjà appliquée dans readSensors)
     int32_t t = (int32_t)(temp * 10.0F + 0.5F);
-    t = constrainInt(t - TEMP_OFFSET_DECIMAL, 0, 999);
+    t = constrainInt(t, 0, 999);
 
     display.setDisplayDigit((uint8_t)(t / 100), 0, false);
     display.setDisplayDigit((uint8_t)((t / 10) % 10), 1, true);
@@ -558,36 +732,16 @@ void displayValues(float temp, float hum, uint16_t co2, float pres)
     display.setDisplayDigit((uint8_t)(p % 10), 12, false);
 }
 
-void updateLedsNormal(uint16_t co2, float pres)
+void updateLedsNormal(uint16_t co2, WeatherForecast weather)
 {
     // Bandeau A: gradient CO2
     for (uint8_t i = 0; i < NUM_LEDS; i++)
     {
-        if (co2 >= CO2_SEUILS[i])
-        {
-            ledsA[i] = CO2_COULEURS[i];
-        }
-        else
-        {
-            ledsA[i] = CRGB::Black;
-        }
+        ledsA[i] = (co2 >= CO2_SEUILS[i]) ? CO2_COULEURS[i] : CRGB::Black;
     }
 
-    // Bandeau B: zone de pression (1 LED blanche)
-    uint8_t zone = 0;
-    for (uint8_t i = 0; i < 4; i++)
-    {
-        if (pres >= PRES_PALIERS[i])
-        {
-            zone = i + 1;
-        }
-    }
-
-    fill_solid(ledsB, NUM_LEDS, CRGB::Black);
-    if (zone < NUM_LEDS)
-    {
-        ledsB[zone] = CRGB::White;
-    }
+    // Bandeau B: couleur météo (tous les LEDs)
+    fill_solid(ledsB, NUM_LEDS, WEATHER_LED_COLORS[weather]);
 
     FastLED.show();
 }
@@ -647,12 +801,12 @@ void updateMinMax(const SensorData *data)
 
     if (data->pressure < mmData.minPres)
     {
-        mmData.minPres = data->pressure;
+        mmData.minPres = data->pressureSea;
         changed = true;
     }
     if (data->pressure > mmData.maxPres)
     {
-        mmData.maxPres = data->pressure;
+        mmData.maxPres = data->pressureSea;
         changed = true;
     }
 
@@ -684,7 +838,7 @@ void handleFatalError(const char *msg)
     while (true)
     {
         delay(100);
-        // Le watchdog va déclencher un reset après 8 secondes
+        // Le watchdog va déclencher un reset après 4 secondes (si activé)
     }
 }
 
@@ -698,10 +852,8 @@ void setup()
     uint8_t mcusr = MCUSR;
     MCUSR = 0; // Clear reset flags
 
-    // Désactiver le watchdog le temps du setup
     wdt_disable();
 
-    // Init Serial
     Serial.begin(115200);
     while (!Serial && millis() < 2000)
         ; // Attendre max 2s
@@ -709,8 +861,9 @@ void setup()
     Serial.println(F("\n=================="));
     Serial.println(F("STATION METEO v2.0"));
     Serial.println(F("=================="));
+    Serial.print(F("version :"));
+    Serial.println(EEPROM_MAGIC_V2);
 
-    // Analyser la cause du reset
     if (mcusr & (1 << WDRF))
     {
         Serial.println(F("[BOOT] Watchdog reset"));
@@ -787,11 +940,16 @@ void setup()
     currentSensor.temperature = 25.0F;
     currentSensor.humidity = 50.0F;
     currentSensor.pressure = 1013.0F;
+    currentSensor.pressureSea = 1013.0F;
     currentSensor.eco2 = 400;
 
-    // Activer le watchdog (8 secondes)
+// Activer le watchdog (4 secondes)
+#if ENABLE_WATCHDOG
     wdt_enable(WATCHDOG_TIMEOUT_MS);
-    Serial.println(F("[WDT] Enabled (8s)"));
+    Serial.println(F("[WDT] Enabled (4s)"));
+#else
+    Serial.println(F("[WDT] Disabled (for testing)"));
+#endif
 
     Serial.println(F("[BOOT] Complete\n"));
 }
@@ -802,8 +960,10 @@ void setup()
 
 void loop()
 {
-    // Reset watchdog en début de loop
+// Reset watchdog en début de loop
+#if ENABLE_WATCHDOG
     wdt_reset();
+#endif
 
     // Variables statiques (persistent entre les appels)
     static unsigned long lastRead = 0;
@@ -827,7 +987,9 @@ void loop()
     {
         lastRead = now;
 
+#if ENABLE_WATCHDOG
         wdt_reset(); // Reset avant opération longue
+#endif
 
         if (readSensors(&currentSensor))
         {
@@ -849,6 +1011,41 @@ void loop()
             Serial.print(currentSensor.eco2);
             Serial.println(F(" ppm"));
 
+            if (pressureHistoryCount == 0U || (now - lastPressureHistoryTime) >= PRES_HISTORY_INTERVAL_MS)
+            {
+                lastPressureHistoryTime = now;
+                updatePressureHistory(currentSensor.pressureSea, now);
+            }
+            float trend = getPressureTrend();
+            currentWeather = classifyWeather(currentSensor.pressureSea, trend);
+
+            Serial.print(F("Pression mer: "));
+            Serial.print(currentSensor.pressureSea, 1);
+            Serial.println(F(" hPa"));
+            Serial.print(F("Tendance 3h : "));
+            Serial.print(trend, 1);
+            Serial.println(F(" hPa/3h"));
+            if (currentWeather == WEATHER_STORMY)
+            {
+                Serial.println(F("Meteo: ORAGEUX"));
+            }
+            else if (currentWeather == WEATHER_RAINY)
+            {
+                Serial.println(F("Meteo: PLUVIEUX"));
+            }
+            else if (currentWeather == WEATHER_CLOUDY)
+            {
+                Serial.println(F("Meteo: NUAGEUX"));
+            }
+            else if (currentWeather == WEATHER_FAIR)
+            {
+                Serial.println(F("Meteo: BEAU"));
+            }
+            else
+            {
+                Serial.println(F("Meteo: ENSOLEILLE"));
+            }
+
             // Mise à jour min/max
             updateMinMax(&currentSensor);
 
@@ -859,8 +1056,8 @@ void loop()
                     currentSensor.temperature,
                     currentSensor.humidity,
                     currentSensor.eco2,
-                    currentSensor.pressure);
-                updateLedsNormal(currentSensor.eco2, currentSensor.pressure);
+                    currentSensor.pressureSea);
+                updateLedsNormal(currentSensor.eco2, currentWeather);
             }
         }
         else
@@ -876,7 +1073,9 @@ void loop()
 
     if (eepromDirty && ((now - lastEepromSave) >= EEPROM_SAVE_INTERVAL_MS))
     {
+#if ENABLE_WATCHDOG
         wdt_reset();
+#endif
 
         Serial.println(F("[EEPROM] Saving min/max..."));
         saveMinMaxToEEPROM();
@@ -924,8 +1123,8 @@ void loop()
                 currentSensor.temperature,
                 currentSensor.humidity,
                 currentSensor.eco2,
-                currentSensor.pressure);
-            updateLedsNormal(currentSensor.eco2, currentSensor.pressure);
+                currentSensor.pressureSea);
+            updateLedsNormal(currentSensor.eco2, currentWeather);
         }
         else if (state == STATE_SHOW_MIN)
         {
@@ -952,8 +1151,8 @@ void loop()
                 currentSensor.temperature,
                 currentSensor.humidity,
                 currentSensor.eco2,
-                currentSensor.pressure);
-            updateLedsNormal(currentSensor.eco2, currentSensor.pressure);
+                currentSensor.pressureSea);
+            updateLedsNormal(currentSensor.eco2, currentWeather);
 
             Serial.println(F("[DISPLAY] Back to NORMAL"));
         }
@@ -971,8 +1170,7 @@ void loop()
         if (blinkOn)
         {
             uint16_t co2Disp = (state == STATE_SHOW_MIN) ? mmData.minCo2 : mmData.maxCo2;
-            float presDisp = (state == STATE_SHOW_MIN) ? mmData.minPres : mmData.maxPres;
-            updateLedsNormal(co2Disp, presDisp);
+            updateLedsNormal(co2Disp, currentWeather);
         }
         else
         {
@@ -1004,11 +1202,5 @@ void loop()
         Serial.print(now / 1000UL);
         Serial.println(F(" s\n"));
     }
-
-    // Petite pause pour ne pas saturer le CPU (optionnel)
     delay(10);
 }
-
-// ============================================================================
-// END OF FILE
-// ============================================================================
